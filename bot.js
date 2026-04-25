@@ -54,12 +54,12 @@ function numLabel(i) {
 
 function formatList(todos) {
   if (!todos.length) return '📭 Список завдань порожній!';
-  const items = todos.map((t, i) => `${numLabel(i)} ${t.text}`).join('\n');
+  const items = todos.map((t, i) => `${numLabel(i)} ${escMd(t.text)}`).join('\n');
   return `📋 *Твій список справ:*\n\n${items}\n\n💪 *Зроби це сьогодні\\!* 🚀`;
 }
 
 function formatDailyReminder(todos) {
-  const items = todos.map((t, i) => `${numLabel(i)} ${t.text}`).join('\n');
+  const items = todos.map((t, i) => `${numLabel(i)} ${escMd(t.text)}`).join('\n');
   return (
     `🌞 *Доброго дня\\! Час не чекає\\!*\n` +
     `━━━━━━━━━━━━━━━━━━\n\n` +
