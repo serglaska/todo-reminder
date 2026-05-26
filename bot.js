@@ -18,6 +18,8 @@ const USERS_FILE = path.join(DATA_DIR, 'users.json');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
+const TIMEOUT_MS = 15 * 60 * 1000;
+
 // ─── Data helpers ─────────────────────────────────────────────────────────────
 
 function readJSON(file, def) {
@@ -33,6 +35,19 @@ function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
+function readTodos() {
+  const raw = readJSON(TODOS_FILE, { current: [], global: [] });
+  // migrate old flat-array format → current list
+  if (Array.isArray(raw)) {
+    const migrated = { current: raw, global: [] };
+    writeJSON(TODOS_FILE, migrated);
+    return migrated;
+  }
+  if (!raw.current) raw.current = [];
+  if (!raw.global)  raw.global  = [];
+  return raw;
+}
+
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
 function log(level, msg) {
@@ -41,8 +56,52 @@ function log(level, msg) {
 
 // ─── In-memory state ──────────────────────────────────────────────────────────
 
-const userStates = {};  // chatId -> 'awaiting_todo'
-const selections = {};  // chatId -> Set of todo IDs
+const userStates      = {};  // chatId -> 'awaiting_todo'
+const userActiveList  = {};  // chatId -> 'current' | 'global'
+const selections      = {};  // chatId -> Set of todo IDs
+
+const stateTimeouts     = {};
+const selectionTimeouts = {};
+
+function getActiveList(chatId) {
+  return userActiveList[chatId] || 'current';
+}
+
+function setUserState(chatId, state) {
+  if (stateTimeouts[chatId]) clearTimeout(stateTimeouts[chatId]);
+  userStates[chatId] = state;
+  stateTimeouts[chatId] = setTimeout(() => {
+    delete userStates[chatId];
+    delete stateTimeouts[chatId];
+    log('INFO', `State timeout cleared for chat ${chatId}`);
+  }, TIMEOUT_MS);
+}
+
+function clearUserState(chatId) {
+  if (stateTimeouts[chatId]) {
+    clearTimeout(stateTimeouts[chatId]);
+    delete stateTimeouts[chatId];
+  }
+  delete userStates[chatId];
+}
+
+function setSelection(chatId, set) {
+  if (selectionTimeouts[chatId]) clearTimeout(selectionTimeouts[chatId]);
+  selections[chatId] = set;
+  selectionTimeouts[chatId] = setTimeout(() => {
+    delete selections[chatId];
+    delete selectionTimeouts[chatId];
+    log('INFO', `Selection timeout cleared for chat ${chatId}`);
+  }, TIMEOUT_MS);
+}
+
+function clearSelection(chatId) {
+  if (selectionTimeouts[chatId]) {
+    clearTimeout(selectionTimeouts[chatId]);
+    delete selectionTimeouts[chatId];
+  }
+  delete selections[chatId];
+}
 
 // ─── Formatting ───────────────────────────────────────────────────────────────
 
@@ -52,10 +111,21 @@ function numLabel(i) {
   return i < NUM_EMOJI.length ? NUM_EMOJI[i] : `${i + 1}.`;
 }
 
-function formatList(todos) {
-  if (!todos.length) return '📭 Список завдань порожній!';
+function escMd(text) {
+  return text.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
+}
+
+const LIST_META = {
+  current: { label: 'Поточні задачі', emoji: '📋' },
+  global:  { label: 'Глобальні задачі', emoji: '🌐' },
+};
+
+function formatList(todos, listType) {
+  const { label, emoji } = LIST_META[listType];
+  const header = escMd(`${emoji} ${label}`);
+  if (!todos.length) return `📭 *${header}* порожній\\!`;
   const items = todos.map((t, i) => `${numLabel(i)} ${escMd(t.text)}`).join('\n');
-  return `📋 *Твій список справ:*\n\n${items}\n\n💪 *Зроби це сьогодні\\!* 🚀`;
+  return `*${header}:*\n\n${items}\n\n💪 *Зроби це\\!* 🚀`;
 }
 
 function formatDailyReminder(todos) {
@@ -69,16 +139,11 @@ function formatDailyReminder(todos) {
   );
 }
 
-// Escape special MarkdownV2 chars in user text
-function escMd(text) {
-  return text.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
-}
-
 // ─── Keyboards ────────────────────────────────────────────────────────────────
 
 const MAIN_KEYBOARD = Markup.keyboard([
   ['➕ Додати', '🗑 Видалити'],
-  ['📋 Список'],
+  ['📋 Поточні', '🌐 Глобальні'],
 ]).resize().persistent();
 
 function deleteKeyboard(todos, selected) {
@@ -109,11 +174,13 @@ bot.start(ctx => {
 
   return ctx.replyWithMarkdownV2(
     '👋 *Привіт\\! Я твій Todo\\-бот\\!*\n\n' +
-    '⏰ Щодня о *13:00* я надішлю тобі нагадування зі списком справ\\.\n\n' +
+    '⏰ Щодня о *13:00* надсилаю нагадування з *поточними* задачами\\.\n\n' +
+    '📋 *Поточні* — справи на зараз\n' +
+    '🌐 *Глобальні* — довгострокові цілі\n\n' +
     '📌 *Команди:*\n' +
     '/start — активувати бота\n' +
     '/stop  — зупинити нагадування\n' +
-    '/list  — показати список зараз',
+    '/list  — показати активний список',
     MAIN_KEYBOARD
   );
 });
@@ -123,6 +190,8 @@ bot.command('stop', ctx => {
   const users = readJSON(USERS_FILE, { active: [] });
   users.active = users.active.filter(id => id !== chatId);
   writeJSON(USERS_FILE, users);
+  clearUserState(chatId);
+  clearSelection(chatId);
   log('INFO', `User ${ctx.from.id} deactivated the bot`);
 
   return ctx.replyWithMarkdownV2(
@@ -131,50 +200,71 @@ bot.command('stop', ctx => {
   );
 });
 
-bot.command('list', ctx => sendList(ctx));
+bot.command('list', ctx => sendActiveList(ctx));
 
 // ─── Button handlers ──────────────────────────────────────────────────────────
 
 bot.hears('➕ Додати', ctx => {
-  userStates[ctx.chat.id] = 'awaiting_todo';
-  return ctx.replyWithMarkdownV2('✏️ *Введи текст завдання:*', Markup.forceReply());
+  const chatId = ctx.chat.id;
+  const listType = getActiveList(chatId);
+  const { label, emoji } = LIST_META[listType];
+  setUserState(chatId, 'awaiting_todo');
+  return ctx.replyWithMarkdownV2(
+    `✏️ *Введи текст завдання для ${escMd(emoji + ' ' + label)}:*`,
+    Markup.forceReply()
+  );
 });
 
 bot.hears('🗑 Видалити', ctx => {
   const chatId = ctx.chat.id;
-  const todos = readJSON(TODOS_FILE, []);
-  if (!todos.length) {
-    return ctx.reply('📭 Список порожній, нема що видаляти!', MAIN_KEYBOARD);
+  const listType = getActiveList(chatId);
+  const todos = readTodos();
+  const list = todos[listType];
+  const { label, emoji } = LIST_META[listType];
+
+  if (!list.length) {
+    return ctx.reply(`📭 ${emoji} ${label} порожній, нема що видаляти!`, MAIN_KEYBOARD);
   }
-  selections[chatId] = new Set();
+
+  setSelection(chatId, new Set());
   return ctx.replyWithMarkdownV2(
-    '🗑 *Обери завдання для видалення:*',
-    deleteKeyboard(todos, selections[chatId])
+    `🗑 *Обери завдання для видалення з ${escMd(emoji + ' ' + label)}:*`,
+    deleteKeyboard(list, selections[chatId])
   );
 });
 
-bot.hears('📋 Список', ctx => sendList(ctx));
+bot.hears('📋 Поточні', ctx => {
+  userActiveList[ctx.chat.id] = 'current';
+  return sendActiveList(ctx);
+});
 
-// ─── Message handler (for awaiting todo input) ────────────────────────────────
+bot.hears('🌐 Глобальні', ctx => {
+  userActiveList[ctx.chat.id] = 'global';
+  return sendActiveList(ctx);
+});
+
+// ─── Message handler ──────────────────────────────────────────────────────────
 
 bot.on('text', ctx => {
   const chatId = ctx.chat.id;
   const text = ctx.message.text;
 
   if (userStates[chatId] === 'awaiting_todo') {
-    const todos = readJSON(TODOS_FILE, []);
+    const listType = getActiveList(chatId);
+    const todos = readTodos();
     const todo = {
       id: Date.now().toString(),
       text: text.trim(),
       createdAt: new Date().toISOString(),
     };
-    todos.push(todo);
+    todos[listType].push(todo);
     writeJSON(TODOS_FILE, todos);
-    delete userStates[chatId];
-    log('INFO', `Todo added by user ${ctx.from.id}: "${todo.text}"`);
+    clearUserState(chatId);
+    log('INFO', `Todo added by user ${ctx.from.id} to ${listType}: "${todo.text}"`);
 
+    const { label, emoji } = LIST_META[listType];
     return ctx.replyWithMarkdownV2(
-      `✅ *Додано:*\n📌 ${escMd(todo.text)}`,
+      `✅ *Додано до ${escMd(emoji + ' ' + label)}:*\n📌 ${escMd(todo.text)}`,
       MAIN_KEYBOARD
     );
   }
@@ -186,13 +276,14 @@ bot.action(/^t:(.+)$/, async ctx => {
   const chatId = ctx.chat.id;
   const id = ctx.match[1];
 
-  if (!selections[chatId]) selections[chatId] = new Set();
+  if (!selections[chatId]) setSelection(chatId, new Set());
 
   if (selections[chatId].has(id)) selections[chatId].delete(id);
   else selections[chatId].add(id);
 
-  const todos = readJSON(TODOS_FILE, []);
-  await ctx.editMessageReplyMarkup(deleteKeyboard(todos, selections[chatId]).reply_markup);
+  const todos = readTodos();
+  const listType = getActiveList(chatId);
+  await ctx.editMessageReplyMarkup(deleteKeyboard(todos[listType], selections[chatId]).reply_markup);
   return ctx.answerCbQuery();
 });
 
@@ -204,13 +295,14 @@ bot.action('del:confirm', async ctx => {
     return ctx.answerCbQuery('⚠️ Нічого не вибрано!');
   }
 
-  let todos = readJSON(TODOS_FILE, []);
-  const removed = todos.filter(t => selected.has(t.id));
-  todos = todos.filter(t => !selected.has(t.id));
+  const listType = getActiveList(chatId);
+  const todos = readTodos();
+  const removed = todos[listType].filter(t => selected.has(t.id));
+  todos[listType] = todos[listType].filter(t => !selected.has(t.id));
   writeJSON(TODOS_FILE, todos);
-  delete selections[chatId];
+  clearSelection(chatId);
 
-  log('INFO', `User ${ctx.from.id} deleted ${removed.length} todo(s)`);
+  log('INFO', `User ${ctx.from.id} deleted ${removed.length} todo(s) from ${listType}`);
 
   const removedText = removed.map(t => `• ${escMd(t.text)}`).join('\n');
   await ctx.editMessageText(
@@ -222,7 +314,7 @@ bot.action('del:confirm', async ctx => {
 });
 
 bot.action('del:cancel', async ctx => {
-  delete selections[ctx.chat.id];
+  clearSelection(ctx.chat.id);
   await ctx.editMessageText('❌ Видалення скасовано.');
   await ctx.reply('👍 Скасовано.', MAIN_KEYBOARD);
   return ctx.answerCbQuery();
@@ -230,25 +322,27 @@ bot.action('del:cancel', async ctx => {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function sendList(ctx) {
-  const todos = readJSON(TODOS_FILE, []);
-  return ctx.replyWithMarkdownV2(formatList(todos), MAIN_KEYBOARD);
+function sendActiveList(ctx) {
+  const chatId = ctx.chat.id;
+  const listType = getActiveList(chatId);
+  const todos = readTodos();
+  return ctx.replyWithMarkdownV2(formatList(todos[listType], listType), MAIN_KEYBOARD);
 }
 
 // ─── Daily reminder @ 13:00 Kyiv ─────────────────────────────────────────────
 
 cron.schedule('0 13 * * *', () => {
-  const todos = readJSON(TODOS_FILE, []);
+  const todos = readTodos();
   const users = readJSON(USERS_FILE, { active: [] });
 
-  if (!todos.length) {
-    log('INFO', 'Daily reminder: list is empty, skipping');
+  if (!todos.current.length) {
+    log('INFO', 'Daily reminder: current list is empty, skipping');
     return;
   }
 
   log('INFO', `Daily reminder: sending to ${users.active.length} user(s)`);
 
-  const message = formatDailyReminder(todos);
+  const message = formatDailyReminder(todos.current);
 
   users.active.forEach(chatId => {
     bot.telegram.sendMessage(chatId, message, { parse_mode: 'MarkdownV2' })
